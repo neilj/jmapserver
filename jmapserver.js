@@ -5,7 +5,7 @@ class JMAPServer {
         this.accountId = options.accountId;
         this.types = options.types;
         this.db = new Database({
-            name: `JMAP-${accountId}`,
+            name: `JMAP-${options.accountId}`,
             version: 1,
             setup(db /*, newVersion, oldVersion*/) {
                 const metaStore = db.createObjectStore('Meta', {
@@ -75,7 +75,7 @@ class JMAPServer {
             Array.isArray(item) &&
             typeof item[0] === 'string' &&
             item[1] &&
-            typeof item[0] === 'object';
+            typeof item[1] === 'object';
         if (
             !methodCalls ||
             !Array.isArray(methodCalls) ||
@@ -88,18 +88,28 @@ class JMAPServer {
         }
         const createdIds = request.createdIds || {};
         const types = this.types;
-        const output;
+        const output = [];
         for (const [name, args, callId] of methodCalls) {
             const [typeName, method] = name.split('/');
             const config = types[typeName];
-            if (!config) {
+            if (!config || !config[method]) {
+                output.push([
+                    'error',
+                    {
+                        type: 'unknownMethod',
+                    },
+                    callId,
+                ]);
+                continue;
             }
+            await this[method](typeName, args, output);
         }
+        return output;
     }
 
     // ---
 
-    async changes(typeName, args) {
+    async changes(typeName, args, output) {
         const sinceState = args.sinceState;
         let maxChanges = args.maxChanges || 0;
         if (!(maxChanges > 0 && maxChanges <= 1024)) {
@@ -120,64 +130,6 @@ class JMAPServer {
         const created = [];
         const updated = [];
         const destroyed = [];
-        await this.db.transaction(['Meta', typeName], 'readonly', async (
-            /** @type IDBTransaction */ transaction,
-        ) => {
-            const metaStore = transaction.objectStore('Meta');
-            const typeStore = transaction.objectStore(typeName);
-            const meta = await _(metaStore.get(typeName));
-            if (meta.highestModSeq === sinceModSeq) {
-                return;
-            }
-            const cursor = typeStore
-                .index('byModSeq')
-                .openCursor(IDBKeyRange.lowerBound(sinceModSeq, true), 'next');
-            let count = 0;
-            for await (const result of iterate(cursor)) {
-                if (count === maxChanges) {
-                    hasMoreChanges = true;
-                    break;
-                }
-                const record = result.value;
-                const id = record.id;
-                const isCreated = record._createdModSeq > sinceModSeq;
-                if (record._deleted) {
-                    if (!isCreated) destroyed.push(id);
-                } else if (isCreated) {
-                    created.push(id);
-                } else {
-                    updated.push(id);
-                }
-                upToModSeq = record._updatedModSeq;
-                count += 1;
-            }
-            if (!hasMoreChanges) {
-                upToModSeq = meta.highestModSeq;
-            }
-        });
-        return {
-            accountId: this.accountId,
-            oldState: sinceState,
-            newState: upToModSeq + '',
-            hasMoreChanges,
-            created,
-            updated,
-            destroyed,
-        };
-    }
-
-    async handleGetRequest(
-        accountId,
-        typeName,
-        /** string[]|null */ ids,
-        properties,
-    ) {
-        if (ids != null && ids.length > this.maxObjectsInGet)
-            return {
-                requestTooLarge: true,
-            };
-
-        let result;
         await this.db.transaction(
             ['Meta', typeName],
             'readonly',
@@ -185,19 +137,83 @@ class JMAPServer {
                 const metaStore = transaction.objectStore('Meta');
                 const typeStore = transaction.objectStore(typeName);
                 const meta = await _(metaStore.get(typeName));
-                let modseq = meta.highestModSeq;
+                if (meta.highestModSeq === sinceModSeq) {
+                    return;
+                }
+                const cursor = typeStore
+                    .index('byModSeq')
+                    .openCursor(
+                        IDBKeyRange.lowerBound(sinceModSeq, true),
+                        'next',
+                    );
+                let count = 0;
+                for await (const result of iterate(cursor)) {
+                    if (count === maxChanges) {
+                        hasMoreChanges = true;
+                        break;
+                    }
+                    const record = result.value;
+                    const id = record.id;
+                    const isCreated = record._createdModSeq > sinceModSeq;
+                    if (record._deleted) {
+                        if (!isCreated) destroyed.push(id);
+                    } else if (isCreated) {
+                        created.push(id);
+                    } else {
+                        updated.push(id);
+                    }
+                    upToModSeq = record._updatedModSeq;
+                    count += 1;
+                }
+                if (!hasMoreChanges) {
+                    upToModSeq = meta.highestModSeq;
+                }
+            },
+        );
+        output.push(typeName + '/changes', {
+            accountId: this.accountId,
+            oldState: sinceState,
+            newState: upToModSeq + '',
+            hasMoreChanges,
+            created,
+            updated,
+            destroyed,
+        });
+    }
 
-                const found = [];
+    async get(typeName, args, output) {
+        const { ids, properties, accountId } = args;
+        if (ids != null && ids.length > this.maxObjectsInGet) {
+            output.push([
+                'error',
+                {
+                    requestTooLarge: true,
+                },
+            ]);
+        }
+        await this.db.transaction(
+            ['Meta', typeName],
+            'readonly',
+            async (transaction) => {
+                const metaStore = transaction.objectStore('Meta');
+                const typeStore = transaction.objectStore(typeName);
+                const meta = await _(metaStore.get(typeName));
+                const modseq = meta.highestModSeq;
+                let found = [];
                 const notFound = [];
                 if (ids == null) {
                     // Get all documents in collection
-                    const numRecords = _(typeStore.count);
-                    if (numRecords > this.maxObjectsInGet)
-                        return {
-                            requestTooLarge,
-                        };
-
-                    found.push(...(await _(typeStore.getAll(null))));
+                    const numRecords = await _(typeStore.count());
+                    if (numRecords > this.maxObjectsInGet) {
+                        output.push([
+                            'error',
+                            {
+                                requestTooLarge: true,
+                            },
+                        ]);
+                        return;
+                    }
+                    found = await _(typeStore.getAll(null));
                 } else {
                     await Promise.all(
                         ids.map(async (id) => {
@@ -207,7 +223,7 @@ class JMAPServer {
                                 // TODO: Remove _xxx fields.
                                 if (properties == null) found.push(val);
                                 else {
-                                    const result = {};
+                                    const result = { id: val.id };
                                     for (const prop of properties) {
                                         const propVal = val[prop];
                                         if (propVal != null)
@@ -220,17 +236,17 @@ class JMAPServer {
                     );
                 }
 
-                result = {
-                    accountId,
-                    state: '' + modseq,
-                    list: found,
-                    notFound,
-                };
+                output.push([
+                    typeName + '/get',
+                    {
+                        accountId,
+                        state: '' + modseq,
+                        list: found,
+                        notFound,
+                    },
+                ]);
             },
         );
-
-        if (result == null) throw Error('Internal error');
-        return result;
     }
 }
 
@@ -260,9 +276,20 @@ class JMAPServer {
         },
     ]);
 
-    console.log(await server.handleGetRequest('', 'Email', null, null));
-    console.log(await server.handleGetRequest('', 'Email', ['123'], null));
     console.log(
-        await server.handleGetRequest('', 'Email', ['123', '321'], ['subject']),
+        await server.process({
+            methodCalls: [
+                ['Email/get', {}, '1'],
+                ['Email/get', { ids: ['123'] }, '2'],
+                [
+                    'Email/get',
+                    {
+                        ids: ['123', '321'],
+                        properties: ['subject'],
+                    },
+                    '3',
+                ],
+            ],
+        }),
     );
 })();
