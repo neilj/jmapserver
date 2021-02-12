@@ -102,27 +102,36 @@ class JMAPServer {
                 ]);
                 continue;
             }
-            await this[method](typeName, args, output);
+            const [ok, result] = await this[method](typeName, args, output);
+            output.push([ok ? name : 'error', result, callId]);
         }
         return output;
     }
 
     // ---
 
-    async changes(typeName, args, output) {
+    async changes(typeName, args) {
         const sinceState = args.sinceState;
         let maxChanges = args.maxChanges || 0;
         if (!(maxChanges > 0 && maxChanges <= 1024)) {
             maxChanges = 1024;
         }
         if (typeof sinceState !== 'string') {
-            // error
-            return;
+            return [
+                false,
+                {
+                    type: 'invalidArguments',
+                },
+            ];
         }
         const sinceModSeq = parseInt(sinceState, 10);
         if (isNaN(sinceModSeq)) {
-            // error
-            return;
+            return [
+                false,
+                {
+                    type: 'cannotCalculateChanges',
+                },
+            ];
         }
         // Do stuff
         let upToModSeq = sinceModSeq;
@@ -130,68 +139,78 @@ class JMAPServer {
         const created = [];
         const updated = [];
         const destroyed = [];
-        await this.db.transaction(
+        return await this.db.transaction(
             ['Meta', typeName],
             'readonly',
             async (transaction) => {
                 const metaStore = transaction.objectStore('Meta');
                 const typeStore = transaction.objectStore(typeName);
                 const meta = await _(metaStore.get(typeName));
-                if (meta.highestModSeq === sinceModSeq) {
-                    return;
+                if (meta.lowestModSeq > sinceModSeq) {
+                    return [
+                        false,
+                        {
+                            type: 'cannotCalculateChanges',
+                        },
+                    ];
                 }
-                const cursor = typeStore
-                    .index('byModSeq')
-                    .openCursor(
-                        IDBKeyRange.lowerBound(sinceModSeq, true),
-                        'next',
-                    );
-                let count = 0;
-                for await (const result of iterate(cursor)) {
-                    if (count === maxChanges) {
-                        hasMoreChanges = true;
-                        break;
+                if (meta.highestModSeq !== sinceModSeq) {
+                    const cursor = typeStore
+                        .index('byModSeq')
+                        .openCursor(
+                            IDBKeyRange.lowerBound(sinceModSeq, true),
+                            'next',
+                        );
+                    let count = 0;
+                    for await (const result of iterate(cursor)) {
+                        if (count === maxChanges) {
+                            hasMoreChanges = true;
+                            break;
+                        }
+                        const record = result.value;
+                        const id = record.id;
+                        const isCreated = record._createdModSeq > sinceModSeq;
+                        if (record._deleted) {
+                            if (!isCreated) destroyed.push(id);
+                        } else if (isCreated) {
+                            created.push(id);
+                        } else {
+                            updated.push(id);
+                        }
+                        upToModSeq = record._updatedModSeq;
+                        count += 1;
                     }
-                    const record = result.value;
-                    const id = record.id;
-                    const isCreated = record._createdModSeq > sinceModSeq;
-                    if (record._deleted) {
-                        if (!isCreated) destroyed.push(id);
-                    } else if (isCreated) {
-                        created.push(id);
-                    } else {
-                        updated.push(id);
+                    if (!hasMoreChanges) {
+                        upToModSeq = meta.highestModSeq;
                     }
-                    upToModSeq = record._updatedModSeq;
-                    count += 1;
                 }
-                if (!hasMoreChanges) {
-                    upToModSeq = meta.highestModSeq;
-                }
+                return [
+                    true,
+                    {
+                        accountId: this.accountId,
+                        oldState: sinceState,
+                        newState: upToModSeq + '',
+                        hasMoreChanges,
+                        created,
+                        updated,
+                        destroyed,
+                    },
+                ];
             },
         );
-        output.push(typeName + '/changes', {
-            accountId: this.accountId,
-            oldState: sinceState,
-            newState: upToModSeq + '',
-            hasMoreChanges,
-            created,
-            updated,
-            destroyed,
-        });
     }
 
-    async get(typeName, args, output) {
+    async get(typeName, args) {
         const { ids, properties, accountId } = args;
         if (ids != null && ids.length > this.maxObjectsInGet) {
-            output.push([
-                'error',
+            return [
+                false,
                 {
-                    requestTooLarge: true,
+                    type: 'requestTooLarge',
                 },
-            ]);
+            ];
         }
-        await this.db.transaction(
+        return await this.db.transaction(
             ['Meta', typeName],
             'readonly',
             async (transaction) => {
@@ -205,13 +224,12 @@ class JMAPServer {
                     // Get all documents in collection
                     const numRecords = await _(typeStore.count());
                     if (numRecords > this.maxObjectsInGet) {
-                        output.push([
-                            'error',
+                        return [
+                            false,
                             {
-                                requestTooLarge: true,
+                                type: 'requestTooLarge',
                             },
-                        ]);
-                        return;
+                        ];
                     }
                     found = await _(typeStore.getAll(null));
                 } else {
@@ -236,15 +254,15 @@ class JMAPServer {
                     );
                 }
 
-                output.push([
-                    typeName + '/get',
+                return [
+                    true,
                     {
                         accountId,
                         state: '' + modseq,
                         list: found,
                         notFound,
                     },
-                ]);
+                ];
             },
         );
     }
@@ -255,13 +273,16 @@ class JMAPServer {
 (async () => {
     const server = new JMAPServer({
         accountId: 'foo',
-        types: {
+        methods: {
+            'Email/get': (server, args) => server.get('Email', args),
+            'Email/changes': (server, args) => server.changes('Email', args),
+            'Thread/get'(server, args) {},
+        },
+        stores: {
             Email: {
-                get: {},
-                changes: {},
-            },
-            Thread: {
-                // ontxn: async (objects, transaction)  => ())}
+                indexes: {
+                    byThreadId: 'threadId',
+                },
             },
             Mailbox: {},
         },
@@ -280,6 +301,20 @@ class JMAPServer {
         await server.process({
             methodCalls: [
                 ['Email/get', {}, '1'],
+                [
+                    'Email/changes',
+                    {
+                        sinceState: '0',
+                    },
+                    'a',
+                ],
+                [
+                    'Email/changes',
+                    {
+                        sinceState: 'adsfadsf',
+                    },
+                    'a',
+                ],
                 ['Email/get', { ids: ['123'] }, '2'],
                 [
                     'Email/get',

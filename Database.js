@@ -59,13 +59,13 @@ class Database {
      */
 
     // Mode = readwrite or readonly
-    async transaction(storeNames, mode, /** @type TxnHandler */fn) {
+    async transaction(storeNames, mode, /** @type TxnHandler */ fn) {
         const db = await this.open();
         return new Promise((resolve, reject) => {
             const transaction = db.transaction(storeNames, mode);
+            const result = fn(transaction);
             transaction.onabort = () => reject(transaction.error);
-            transaction.oncomplete = () => resolve();
-            fn(transaction);
+            transaction.oncomplete = () => resolve(result);
         });
     }
 
