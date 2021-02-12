@@ -1,9 +1,35 @@
 import { Database, iterate, promisify as _ } from './Database.js';
 
+const directGetProperties = (
+    /** @type IDBObjectStore */ typeStore,
+    ids,
+    properties,
+) => {
+    return Promise.all(
+        ids.map(async (id) => {
+            const val = await _(typeStore.get(id));
+
+            if (val == null) return null;
+            else {
+                // TODO: Remove _xxx fields.
+                if (properties == null) return val;
+                else {
+                    const result = { id: val.id };
+                    for (const prop of properties) {
+                        const propVal = val[prop];
+                        if (propVal != null) result[prop] = propVal;
+                    }
+                    return result;
+                }
+            }
+        }),
+    );
+};
+
 class JMAPServer {
     constructor(options) {
         this.accountId = options.accountId;
-        this.types = options.types;
+        this.methods = options.methods;
         this.db = new Database({
             name: `JMAP-${options.accountId}`,
             version: 1,
@@ -11,7 +37,7 @@ class JMAPServer {
                 const metaStore = db.createObjectStore('Meta', {
                     keyPath: 'typeName',
                 });
-                for (const typeName in options.types) {
+                for (const typeName in options.stores) {
                     const store = db.createObjectStore(typeName, {
                         keyPath: 'id',
                     });
@@ -87,12 +113,11 @@ class JMAPServer {
             });
         }
         const createdIds = request.createdIds || {};
-        const types = this.types;
+        const methods = this.methods;
         const output = [];
         for (const [name, args, callId] of methodCalls) {
-            const [typeName, method] = name.split('/');
-            const config = types[typeName];
-            if (!config || !config[method]) {
+            const fn = methods[name];
+            if (!fn) {
                 output.push([
                     'error',
                     {
@@ -102,7 +127,7 @@ class JMAPServer {
                 ]);
                 continue;
             }
-            const [ok, result] = await this[method](typeName, args, output);
+            const [ok, result] = await fn(this, args);
             output.push([ok ? name : 'error', result, callId]);
         }
         return output;
@@ -200,7 +225,7 @@ class JMAPServer {
         );
     }
 
-    async get(typeName, args) {
+    async get(typeName, args, fetch = directGetProperties) {
         const { ids, properties, accountId } = args;
         if (ids != null && ids.length > this.maxObjectsInGet) {
             return [
@@ -233,25 +258,14 @@ class JMAPServer {
                     }
                     found = await _(typeStore.getAll(null));
                 } else {
-                    await Promise.all(
-                        ids.map(async (id) => {
-                            const val = await _(typeStore.get(id));
-                            if (val == null) notFound.push(id);
-                            else {
-                                // TODO: Remove _xxx fields.
-                                if (properties == null) found.push(val);
-                                else {
-                                    const result = { id: val.id };
-                                    for (const prop of properties) {
-                                        const propVal = val[prop];
-                                        if (propVal != null)
-                                            result[prop] = propVal;
-                                    }
-                                    found.push(result);
-                                }
-                            }
-                        }),
-                    );
+                    const result = await fetch(typeStore, ids, properties);
+                    result.forEach((value, i) => {
+                        if (value) {
+                            found.push(value);
+                        } else {
+                            notFound.push(ids[i]);
+                        }
+                    });
                 }
 
                 return [
