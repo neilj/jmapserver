@@ -41,7 +41,14 @@ class JMAPServer {
                     const store = db.createObjectStore(typeName, {
                         keyPath: 'id',
                     });
+                    const indexes = options.stores[typeName].indexes;
                     store.createIndex('byModSeq', '_updatedModSeq');
+                    if (indexes) {
+                        const entries = Object.entries(indexes);
+                        for (const [name, property] of entries) {
+                            store.createIndex(name, property);
+                        }
+                    }
                     metaStore.put({
                         typeName,
                         highestModSeq: 0,
@@ -290,7 +297,29 @@ class JMAPServer {
         methods: {
             'Email/get': (server, args) => server.get('Email', args),
             'Email/changes': (server, args) => server.changes('Email', args),
-            'Thread/get'(server, args) {},
+            'Thread/get': (server, args) =>
+                server.get('Email', args, (
+                    /** @type IDBObjectStore */ typeStore,
+                    ids,
+                    properties,
+                ) => {
+                    const index = typeStore.index('byThreadId');
+                    return Promise.all(
+                        ids.map(async (id) => {
+                            const emails = await _(index.getAll(id));
+                            if (!emails.length) return null;
+                            else {
+                                emails.sort((a, b) =>
+                                    a.receivedAt < b.receivedAt ? -1 : 1,
+                                );
+                                return {
+                                    id,
+                                    emailIds: emails.map((x) => x.id),
+                                };
+                            }
+                        }),
+                    );
+                }),
         },
         stores: {
             Email: {
@@ -307,7 +336,15 @@ class JMAPServer {
     server.addRecords('Email', [
         {
             id: '123',
+            threadId: '341',
             subject: 'This is the subject',
+            receivedAt: '2020-01-02T00:00:00Z',
+        },
+        {
+            id: '234',
+            threadId: '341',
+            subject: 'This is the subject',
+            receivedAt: '2020-01-01T00:00:00Z',
         },
     ]);
 
@@ -330,6 +367,7 @@ class JMAPServer {
                     'a',
                 ],
                 ['Email/get', { ids: ['123'] }, '2'],
+                ['Thread/get', { ids: ['341', '333'] }, 'z'],
                 [
                     'Email/get',
                     {
