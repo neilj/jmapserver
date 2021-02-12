@@ -1,18 +1,9 @@
 import { Database, iterate, promisify as _ } from './Database.js';
 
-const maxObjectsInGet = 1000;
-
-const types = {
-    Email: {},
-    Thread: {
-        // ontxn: async (objects, transaction)  => ())}
-    },
-    Mailbox: {},
-};
-
 class JMAPServer {
-    constructor(accountId) {
-        this.accountId = accountId;
+    constructor(options) {
+        this.accountId = options.accountId;
+        this.types = options.types;
         this.db = new Database({
             name: `JMAP-${accountId}`,
             version: 1,
@@ -20,7 +11,7 @@ class JMAPServer {
                 const metaStore = db.createObjectStore('Meta', {
                     keyPath: 'typeName',
                 });
-                for (const typeName in types) {
+                for (const typeName in options.types) {
                     const store = db.createObjectStore(typeName, {
                         keyPath: 'id',
                     });
@@ -68,6 +59,45 @@ class JMAPServer {
             });
         });
     }
+
+    // ---
+
+    async process(request, session) {
+        if (!request) {
+            reject({
+                type: 'urn:ietf:params:jmap:error:notJSON',
+                status: 400,
+            });
+            return;
+        }
+        const methodCalls = request.methodCalls;
+        const isInvocation = (item) =>
+            Array.isArray(item) &&
+            typeof item[0] === 'string' &&
+            item[1] &&
+            typeof item[0] === 'object';
+        if (
+            !methodCalls ||
+            !Array.isArray(methodCalls) ||
+            !methodCalls.every(isInvocation)
+        ) {
+            reject({
+                type: 'urn:ietf:params:jmap:error:notRequest',
+                status: 400,
+            });
+        }
+        const createdIds = request.createdIds || {};
+        const types = this.types;
+        const output;
+        for (const [name, args, callId] of methodCalls) {
+            const [typeName, method] = name.split('/');
+            const config = types[typeName];
+            if (!config) {
+            }
+        }
+    }
+
+    // ---
 
     async changes(typeName, args) {
         const sinceState = args.sinceState;
@@ -136,94 +166,103 @@ class JMAPServer {
         };
     }
 
-    async handleGetRequest(accountId, typeName, /** string[]|null */ ids, properties) {
-        if (ids != null && ids.length > maxObjectsInGet) return {
-            requestTooLarge: true
-        }
+    async handleGetRequest(
+        accountId,
+        typeName,
+        /** string[]|null */ ids,
+        properties,
+    ) {
+        if (ids != null && ids.length > this.maxObjectsInGet)
+            return {
+                requestTooLarge: true,
+            };
 
-        let result
-        await this.db.transaction(['Meta', typeName], 'readonly', async transaction => {
-            const metaStore = transaction.objectStore('Meta');
-            const typeStore = transaction.objectStore(typeName);
-            const meta = await _(metaStore.get(typeName));
-            let modseq = meta.highestModSeq;
+        let result;
+        await this.db.transaction(
+            ['Meta', typeName],
+            'readonly',
+            async (transaction) => {
+                const metaStore = transaction.objectStore('Meta');
+                const typeStore = transaction.objectStore(typeName);
+                const meta = await _(metaStore.get(typeName));
+                let modseq = meta.highestModSeq;
 
-            const found = []
-            const notFound = []
-            if (ids == null) {
-                // Get all documents in collection
-                const numRecords = _(typeStore.count)
-                if (numRecords > maxObjectsInGet) return {
-                    requestTooLarge
+                const found = [];
+                const notFound = [];
+                if (ids == null) {
+                    // Get all documents in collection
+                    const numRecords = _(typeStore.count);
+                    if (numRecords > this.maxObjectsInGet)
+                        return {
+                            requestTooLarge,
+                        };
+
+                    found.push(...(await _(typeStore.getAll(null))));
+                } else {
+                    await Promise.all(
+                        ids.map(async (id) => {
+                            const val = await _(typeStore.get(id));
+                            if (val == null) notFound.push(id);
+                            else {
+                                // TODO: Remove _xxx fields.
+                                if (properties == null) found.push(val);
+                                else {
+                                    const result = {};
+                                    for (const prop of properties) {
+                                        const propVal = val[prop];
+                                        if (propVal != null)
+                                            result[prop] = propVal;
+                                    }
+                                    found.push(result);
+                                }
+                            }
+                        }),
+                    );
                 }
 
-                found.push(...await _(typeStore.getAll(null)))
-            } else {
-                await Promise.all(ids.map(async id => {
-                    const val = await _(typeStore.get(id))
-                    if (val == null) notFound.push(id)
-                    else {
-                        // TODO: Remove _xxx fields.
-                        if (properties == null) found.push(val)
-                        else {
-                            const result = {}
-                            for (const prop of properties) {
-                                const propVal = val[prop]
-                                if (propVal != null) result[prop] = propVal
-                            }
-                            found.push(result)
-                        }
-                    }
-                }))
-            }
+                result = {
+                    accountId,
+                    state: '' + modseq,
+                    list: found,
+                    notFound,
+                };
+            },
+        );
 
-            result = {
-                accountId,
-                state: ''+modseq,
-                list: found,
-                notFound
-            }
-        })
-
-        if (result == null) throw Error('Internal error')
-        return result
+        if (result == null) throw Error('Internal error');
+        return result;
     }
 }
 
 // ---
 
-const process = (request, session) => {
-    return new Promise((resolve, reject) => {
-        if (!request) {
-            reject({
-                type: 'urn:ietf:params:jmap:error:notJSON',
-                status: 400,
-            });
-            return;
-        }
-        const methodCalls = request.methodCalls;
-        if (!methodCalls || !Array.isArray(methodCalls)) {
-            reject({
-                type: 'urn:ietf:params:jmap:error:notRequest',
-                status: 400,
-            });
-        }
-        const createdIds = request.createdIds || {};
+(async () => {
+    const server = new JMAPServer({
+        accountId: 'foo',
+        types: {
+            Email: {
+                get: {},
+                changes: {},
+            },
+            Thread: {
+                // ontxn: async (objects, transaction)  => ())}
+            },
+            Mailbox: {},
+        },
+        maxObjectsInGet: 1000,
     });
-};
-
-// ---
-
-;(async () => {
-    const server = new JMAPServer('foo');
     window.server = server;
 
-    server.addRecords('Email', [{
-        id: '123',
-        subject: 'This is the subject',
-    }])
+    server.addRecords('Email', [
+        {
+            id: '123',
+            subject: 'This is the subject',
+        },
+    ]);
 
-    console.log(await server.handleGetRequest('', 'Email', null, null))
-    console.log(await server.handleGetRequest('', 'Email', ["123"], null))
-    console.log(await server.handleGetRequest('', 'Email', ["123", '321'], ['subject']))
-})()
+    console.log(await server.handleGetRequest('', 'Email', null, null));
+    console.log(await server.handleGetRequest('', 'Email', ['123'], null));
+    console.log(
+        await server.handleGetRequest('', 'Email', ['123', '321'], ['subject']),
+    );
+})();
