@@ -1,8 +1,12 @@
 import { Database, iterate, promisify as _ } from './Database.js';
 
 const types = {
-    Email: {},
-    Thread: {},
+    Email: {
+
+    },
+    Thread: {
+        // ontxn: async (objects, transaction)  => ())}
+    },
     Mailbox: {},
 };
 
@@ -30,11 +34,11 @@ class JMAPServer {
         });
     }
 
-    addRecords(typeName, records) {
+    addRecords(/** @type string */ typeName, /** @type any[] */records) {
         this.db.transaction(
             ['Meta', typeName],
             'readwrite',
-            async (transaction) => {
+            async (/** @type IDBTransaction */ transaction) => {
                 const metaStore = transaction.objectStore('Meta');
                 const typeStore = transaction.objectStore(typeName);
                 const meta = await _(metaStore.get(typeName));
@@ -43,6 +47,9 @@ class JMAPServer {
                 );
                 let modseq = meta.highestModSeq;
                 records.forEach((record, i) => {
+                    if (!record.id) {
+                        throw new Error('Must have an id!')
+                    }
                     modseq += 1;
                     const prevValue = existing[i];
                     typeStore.put({
@@ -52,7 +59,7 @@ class JMAPServer {
                             ? prevValue._createdModSeq
                             : modseq,
                         _updatedModSeq: modseq,
-                        deleted: null,
+                        _deleted: null,
                     });
                 });
                 metaStore.put({
@@ -85,3 +92,11 @@ const process = (request, session) => {
         const createdIds = request.createdIds || {};
     });
 };
+
+// ---
+
+const server = new JMAPServer('foo');
+server.addRecords('Email', [{
+    id: '123',
+    subject: 'This is the subject',
+}])
