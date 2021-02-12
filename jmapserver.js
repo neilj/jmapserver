@@ -1,5 +1,7 @@
 import { Database, iterate, promisify as _ } from './Database.js';
 
+const maxObjectsInGet = 1000;
+
 const types = {
     Email: {},
     Thread: {
@@ -133,6 +135,59 @@ class JMAPServer {
             destroyed,
         };
     }
+
+    async handleGetRequest(accountId, typeName, /** string[]|null */ ids, properties) {
+        if (ids != null && ids.length > maxObjectsInGet) return {
+            requestTooLarge: true
+        }
+
+        let result
+        await this.db.transaction(['Meta', typeName], 'readonly', async transaction => {
+            const metaStore = transaction.objectStore('Meta');
+            const typeStore = transaction.objectStore(typeName);
+            const meta = await _(metaStore.get(typeName));
+            let modseq = meta.highestModSeq;
+
+            const found = []
+            const notFound = []
+            if (ids == null) {
+                // Get all documents in collection
+                const numRecords = _(typeStore.count)
+                if (numRecords > maxObjectsInGet) return {
+                    requestTooLarge
+                }
+
+                found.push(...await _(typeStore.getAll(null)))
+            } else {
+                await Promise.all(ids.map(async id => {
+                    const val = await _(typeStore.get(id))
+                    if (val == null) notFound.push(id)
+                    else {
+                        // TODO: Remove _xxx fields.
+                        if (properties == null) found.push(val)
+                        else {
+                            const result = {}
+                            for (const prop of properties) {
+                                const propVal = val[prop]
+                                if (propVal != null) result[prop] = propVal
+                            }
+                            found.push(result)
+                        }
+                    }
+                }))
+            }
+
+            result = {
+                accountId,
+                state: ''+modseq,
+                list: found,
+                notFound
+            }
+        })
+
+        if (result == null) throw Error('Internal error')
+        return result
+    }
 }
 
 // ---
@@ -159,12 +214,16 @@ const process = (request, session) => {
 
 // ---
 
-const server = new JMAPServer('foo');
-server.addRecords('Email', [
-    {
+;(async () => {
+    const server = new JMAPServer('foo');
+    window.server = server;
+
+    server.addRecords('Email', [{
         id: '123',
         subject: 'This is the subject',
-    },
-]);
+    }])
 
-window.server = server;
+    console.log(await server.handleGetRequest('', 'Email', null, null))
+    console.log(await server.handleGetRequest('', 'Email', ["123"], null))
+    console.log(await server.handleGetRequest('', 'Email', ["123", '321'], ['subject']))
+})()

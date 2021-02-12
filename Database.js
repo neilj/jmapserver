@@ -53,8 +53,13 @@ class Database {
         return _db;
     }
 
+    /**
+     * @callback TxnHandler
+     * @param {IDBTransaction} txn
+     */
+
     // Mode = readwrite or readonly
-    async transaction(storeNames, mode, fn) {
+    async transaction(storeNames, mode, /** @type TxnHandler */fn) {
         const db = await this.open();
         return new Promise((resolve, reject) => {
             const transaction = db.transaction(storeNames, mode);
